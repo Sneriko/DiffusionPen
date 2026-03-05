@@ -96,8 +96,16 @@ If you find our work useful for your research, please cite:
 If your data is full-page images + PAGE-XML line annotations, you can convert it to a line-level manifest with:
 
 ```bash
-python utils/pagexml_to_manifest.py   --xml-root /data/pagexml   --images-root /data/page_images   --out-root /data/diffusionpen_lines   --writer-mode volume   --split-by volume   --relative-paths
+python utils/pagexml_to_manifest.py \
+  --data-root /data/historical_collection \
+  --out-root /data/diffusionpen_lines \
+  --writer-mode volume \
+  --split-by volume \
+  --relative-paths
 ```
+
+`--data-root` recursively scans a single tree for both XML and image files, then pairs files by basename (XML filename stem ↔ image filename stem).
+(Alternative mode: pass separate `--xml-root` and `--images-root`.)
 
 Output manifest (`lines_manifest.tsv`) columns (tab-separated):
 

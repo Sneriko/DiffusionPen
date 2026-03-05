@@ -3,15 +3,6 @@
 
 Output schema (TSV):
 split\timage_path\txml_path\tline_id\twriter_id\ttranscription\tbbox_xyxy\tpolygon_xy
-
-- split: train|val|test (or custom)
-- image_path: path to cropped line image (relative by default)
-- xml_path: source PAGE-XML path
-- line_id: TextLine/@id
-- writer_id: pseudo writer assignment (configurable)
-- transcription: UnicodeText string
-- bbox_xyxy: "x1,y1,x2,y2"
-- polygon_xy: "x1,y1 x2,y2 ..."
 """
 
 from __future__ import annotations
@@ -27,7 +18,6 @@ from PIL import Image
 
 
 def find_with_ns(root: ET.Element, tag: str):
-    """Yield elements ending with tag irrespective of namespace prefix."""
     for elem in root.iter():
         if elem.tag.endswith(tag):
             yield elem
@@ -106,18 +96,18 @@ def default_page_id(xml_path: Path) -> str:
     return xml_path.stem
 
 
-def split_for_volume(volume_id: str, vol_to_split: dict[str, str], train_ratio: float, val_ratio: float):
-    if volume_id in vol_to_split:
-        return vol_to_split[volume_id]
+def split_for_volume(key: str, key_to_split: dict[str, str], train_ratio: float, val_ratio: float):
+    if key in key_to_split:
+        return key_to_split[key]
     r = random.random()
     if r < train_ratio:
-        s = "train"
+        split = "train"
     elif r < train_ratio + val_ratio:
-        s = "val"
+        split = "val"
     else:
-        s = "test"
-    vol_to_split[volume_id] = s
-    return s
+        split = "test"
+    key_to_split[key] = split
+    return split
 
 
 def assign_writer_id(mode: str, volume_id: str, page_id: str):
@@ -130,10 +120,59 @@ def assign_writer_id(mode: str, volume_id: str, page_id: str):
     raise ValueError(f"Unknown writer mode: {mode}")
 
 
+def build_image_basename_index(data_root: Path, image_exts: set[str]):
+    by_base = defaultdict(list)
+    for ext in image_exts:
+        for p in data_root.rglob(f"*{ext}"):
+            by_base[p.stem].append(p)
+    return by_base
+
+
+def choose_image_for_xml_in_single_root(xml_path: Path, _xml_image_name: str | None, basename_index: dict[str, list[Path]]):
+    # strict basename pairing: XML filename stem <-> image filename stem
+    # (xml_image_name is intentionally ignored in single-root mode)
+    base = xml_path.stem
+    candidates = basename_index.get(base, [])
+    if not candidates:
+        return None
+
+    # prefer same directory then closest ancestor, then lexical first
+    same_dir = [c for c in candidates if c.parent == xml_path.parent]
+    if same_dir:
+        return sorted(same_dir)[0]
+
+    rel_parts = xml_path.parts
+    scored = []
+    for c in candidates:
+        c_parts = c.parts
+        common = 0
+        for a, b in zip(rel_parts, c_parts):
+            if a == b:
+                common += 1
+            else:
+                break
+        scored.append((common, len(c_parts), str(c), c))
+    scored.sort(reverse=True)
+    return scored[0][3]
+
+
+def resolve_paths(args):
+    if args.data_root is not None:
+        xml_root = args.data_root
+        images_root = args.data_root
+    else:
+        if args.xml_root is None or args.images_root is None:
+            raise ValueError("Use either --data-root OR both --xml-root and --images-root")
+        xml_root = args.xml_root
+        images_root = args.images_root
+    return xml_root, images_root
+
+
 def main():
     ap = argparse.ArgumentParser(description="Build line-crop manifest from PAGE-XML")
-    ap.add_argument("--xml-root", type=Path, required=True, help="Root containing PAGE-XML files")
-    ap.add_argument("--images-root", type=Path, required=True, help="Root containing full page images")
+    ap.add_argument("--data-root", type=Path, default=None, help="Single root containing both XML and image files (recursive)")
+    ap.add_argument("--xml-root", type=Path, default=None, help="Root containing PAGE-XML files")
+    ap.add_argument("--images-root", type=Path, default=None, help="Root containing full page images")
     ap.add_argument("--out-root", type=Path, required=True, help="Root to write line crops + manifest")
     ap.add_argument("--manifest-name", default="lines_manifest.tsv")
     ap.add_argument("--image-exts", default=".jpg,.jpeg,.png,.tif,.tiff")
@@ -152,17 +191,23 @@ def main():
     if args.train_ratio + args.val_ratio >= 1.0:
         raise ValueError("train_ratio + val_ratio must be < 1.0")
 
+    xml_root, images_root = resolve_paths(args)
+
     args.out_root.mkdir(parents=True, exist_ok=True)
     crops_dir = args.out_root / "line_crops"
     crops_dir.mkdir(parents=True, exist_ok=True)
 
     exts = {e.strip().lower() for e in args.image_exts.split(",") if e.strip()}
 
-    xml_files = sorted(args.xml_root.rglob("*.xml"))
+    xml_files = sorted(xml_root.rglob("*.xml"))
     if not xml_files:
-        raise ValueError(f"No XML files found under {args.xml_root}")
+        raise ValueError(f"No XML files found under {xml_root}")
 
-    vol_to_split: dict[str, str] = {}
+    basename_index = None
+    if args.data_root is not None:
+        basename_index = build_image_basename_index(args.data_root, exts)
+
+    key_to_split: dict[str, str] = {}
     writer_vocab: dict[str, int] = {}
     writer_counts = defaultdict(int)
     rows_out = []
@@ -172,51 +217,45 @@ def main():
         if not lines:
             continue
 
-        rel_xml = xml_path.relative_to(args.xml_root)
-
-        candidate_paths = []
-        if image_filename:
-            p = (args.images_root / rel_xml.parent / image_filename)
-            candidate_paths.append(p)
-            candidate_paths.append(args.images_root / image_filename)
-
-        if not candidate_paths:
-            candidate_paths.append(args.images_root / rel_xml.with_suffix(".jpg"))
+        rel_xml = xml_path.relative_to(xml_root)
 
         page_image = None
-        page_path = None
-        for cand in candidate_paths:
-            if cand.suffix.lower() in exts and cand.exists():
-                page_path = cand
-                page_image = Image.open(cand).convert("RGB")
-                break
-            if cand.exists() and cand.suffix:
-                page_path = cand
-                page_image = Image.open(cand).convert("RGB")
-                break
+
+        if args.data_root is not None:
+            resolved = choose_image_for_xml_in_single_root(xml_path, image_filename, basename_index)
+            if resolved is not None and resolved.exists():
+                page_image = Image.open(resolved).convert("RGB")
+        else:
+            candidate_paths = []
+            if image_filename:
+                candidate_paths.append(images_root / rel_xml.parent / image_filename)
+                candidate_paths.append(images_root / image_filename)
+            if not candidate_paths:
+                candidate_paths.append(images_root / rel_xml.with_suffix(".jpg"))
+
+            for cand in candidate_paths:
+                if cand.exists() and (cand.suffix.lower() in exts or cand.suffix):
+                    page_image = Image.open(cand).convert("RGB")
+                    break
+
+            if page_image is None:
+                stem = rel_xml.with_suffix("")
+                for ext in exts:
+                    cand = images_root / f"{stem}{ext}"
+                    if cand.exists():
+                        page_image = Image.open(cand).convert("RGB")
+                        break
 
         if page_image is None:
-            stem = rel_xml.with_suffix("")
-            found = None
-            for ext in exts:
-                cand = args.images_root / f"{stem}{ext}"
-                if cand.exists():
-                    found = cand
-                    break
-            if found is None:
-                print(f"[WARN] Missing page image for XML: {xml_path}")
-                continue
-            page_path = found
-            page_image = Image.open(found).convert("RGB")
+            print(f"[WARN] Missing page image for XML: {xml_path}")
+            continue
 
         w, h = page_image.size
-        volume_id = default_volume_id(xml_path, args.xml_root)
+        volume_id = default_volume_id(xml_path, xml_root)
         page_id = default_page_id(xml_path)
 
-        if args.split_by == "volume":
-            split = split_for_volume(volume_id, vol_to_split, args.train_ratio, args.val_ratio)
-        else:
-            split = split_for_volume(page_id, vol_to_split, args.train_ratio, args.val_ratio)
+        split_key = volume_id if args.split_by == "volume" else page_id
+        split = split_for_volume(split_key, key_to_split, args.train_ratio, args.val_ratio)
 
         writer_key = assign_writer_id(args.writer_mode, volume_id, page_id)
         if writer_key not in writer_vocab:
@@ -285,10 +324,7 @@ def main():
     print(f"Pseudo-writer classes: {len(writer_vocab)}")
     if writer_counts:
         sizes = sorted(writer_counts.values())
-        print(
-            "Writer lines stats: "
-            f"min={sizes[0]}, median={sizes[len(sizes)//2]}, max={sizes[-1]}"
-        )
+        print(f"Writer lines stats: min={sizes[0]}, median={sizes[len(sizes)//2]}, max={sizes[-1]}")
 
 
 if __name__ == "__main__":
