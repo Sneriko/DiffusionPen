@@ -1,0 +1,21 @@
+# Core numerical + imaging
+numpy
+Pillow
+scikit-image
+opencv-python
+
+# PyTorch stack (install CUDA-specific wheels as needed)
+torch
+torchvision
+
+# Model/training utilities
+tqdm
+einops
+timm
+wandb
+
+# Hugging Face ecosystem used by DiffusionPen
+transformers
+diffusers
+accelerate
+safetensors

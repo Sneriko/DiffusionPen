@@ -89,3 +89,29 @@ If you find our work useful for your research, please cite:
   year={2024}
 }
 
+
+
+## 🧾 PAGE-XML to line-manifest conversion (for custom historical datasets)
+
+If your data is full-page images + PAGE-XML line annotations, you can convert it to a line-level manifest with:
+
+```bash
+python utils/pagexml_to_manifest.py   --xml-root /data/pagexml   --images-root /data/page_images   --out-root /data/diffusionpen_lines   --writer-mode volume   --split-by volume   --relative-paths
+```
+
+Output manifest (`lines_manifest.tsv`) columns (tab-separated):
+
+- `split` (`train|val|test`)
+- `image_path` (line crop path)
+- `xml_path` (source PAGE-XML path)
+- `line_id` (PAGE `TextLine/@id`)
+- `writer_id` (pseudo writer class, integer)
+- `transcription` (line GT)
+- `bbox_xyxy` (`x1,y1,x2,y2`)
+- `polygon_xy` (`x1,y1 x2,y2 ...`)
+
+Writer assignment modes:
+- `volume`: all pages in a volume share one writer ID (recommended bootstrap)
+- `page`: each page is a writer ID
+- `volume_page`: unique writer ID per (volume, page)
+
