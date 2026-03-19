@@ -106,7 +106,7 @@ python utils/pagexml_to_manifest.py \
 `--data-root` recursively scans a single tree for both XML and image files, then pairs files by basename (XML filename stem ↔ image filename stem).
 (Alternative mode: pass separate `--xml-root` and `--images-root`.)
 
-The manifest builder now counts volumes as the folders that contain a `page/` directory, samples up to 10 random consecutive pages per volume, keeps all sampled pages from a volume under one pseudo-style / writer ID, and assigns the final 10% of sampled pages from each volume to validation (`val`) with the remainder going to training. This keeps writer IDs shared across train and val so the style-encoder manifest training script can consume the output directly.
+The manifest builder now counts volumes as the folders that contain a `page/` directory, samples up to 10 random consecutive pages per volume, keeps all sampled pages from a volume under one pseudo-style / writer ID, and assigns the final 10% of sampled pages from each volume to validation (`val`) with the remainder going to training. After crop/text filtering, it also repairs any validation-only writer IDs by moving those rows back to train, so the style-encoder manifest training script can consume the output directly.
 
 Output manifest (`lines_manifest.tsv`) columns (tab-separated):
 

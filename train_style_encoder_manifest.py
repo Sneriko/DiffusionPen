@@ -105,6 +105,7 @@ def main():
         image_width=args.image_width,
         grayscale=args.grayscale,
         writer_to_label=train_ds.writer_to_label,
+        unknown_writer_behavior="filter",
     )
 
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers, pin_memory=True)
