@@ -8,12 +8,12 @@ This version:
 - finds PAGE XML recursively under any folder path containing "page"
 - ignores ALTO XML
 - matches images by PAGE imageFilename or basename
-- derives volume_id from filename stem before first underscore
+- treats each volume (folder containing the page directory) as one hand
+- samples exactly two random consecutive pages per volume when available
+- assigns 10% of volumes to eval/val and the rest to train
 - crops by polygon, not simple bbox
 - masks out everything outside the polygon
 - saves RGBA PNGs with transparent background by default
-- creates only train/val splits
-- assigns splits deterministically by key count, not per-file random draw
 """
 
 from __future__ import annotations
@@ -26,6 +26,9 @@ from pathlib import Path
 import xml.etree.ElementTree as ET
 
 from PIL import Image, ImageDraw
+
+
+EVAL_RATIO = 0.1
 
 
 def find_with_ns(root: ET.Element, tag: str):
@@ -136,52 +139,75 @@ def extract_lines(xml_path: Path):
     return xml_image_filename(root), rows
 
 
-def volume_id_from_stem(path: Path) -> str:
-    """Infer volume id from basename: <volume>_<page> -> <volume>."""
-    stem = path.stem
-    if "_" in stem:
-        return stem.split("_", 1)[0]
-    return stem
-
-
 def default_page_id(xml_path: Path) -> str:
     return xml_path.stem
 
 
-def make_split_map(keys, train_ratio: float, seed: int):
-    """Create a deterministic train/val split map from unique keys.
+def find_page_xml_files(root: Path):
+    xml_files = []
+    for p in root.rglob("*.xml"):
+        parent_parts_lower = [part.lower() for part in p.parent.parts]
+        if "page" in parent_parts_lower:
+            xml_files.append(p)
+    return sorted(xml_files)
 
-    Only train and val are used. If there are at least 2 unique keys,
-    guarantees at least 1 key in val and at least 1 in train.
-    """
-    unique_keys = sorted(set(keys))
-    if not unique_keys:
-        raise ValueError("No split keys found.")
+
+def find_page_ancestor(path: Path, stop_root: Path) -> Path:
+    current = path.parent.resolve()
+    stop_root = stop_root.resolve()
+    while True:
+        if current.name.lower() == "page":
+            return current
+        if current == stop_root or current.parent == current:
+            return stop_root
+        current = current.parent
+
+
+def infer_volume_dir(xml_path: Path, stop_root: Path) -> Path:
+    pages_root = find_page_ancestor(xml_path, stop_root)
+    if pages_root != stop_root:
+        return pages_root.parent
+    return xml_path.parent
+
+
+def choose_sampled_pages_by_volume(xml_files, xml_root: Path, seed: int):
+    grouped = defaultdict(list)
+    for xml_path in xml_files:
+        volume_dir = infer_volume_dir(xml_path, xml_root)
+        grouped[volume_dir].append(xml_path)
 
     rng = random.Random(seed)
-    rng.shuffle(unique_keys)
+    sampled = {}
+    for volume_dir, pages in grouped.items():
+        ordered_pages = sorted(pages)
+        if len(ordered_pages) <= 2:
+            sampled[volume_dir] = ordered_pages
+            continue
 
-    n = len(unique_keys)
+        start_idx = rng.randint(0, len(ordered_pages) - 2)
+        sampled[volume_dir] = ordered_pages[start_idx : start_idx + 2]
 
-    if n == 1:
-        return {unique_keys[0]: "train"}
+    return sampled
 
-    n_train = int(round(n * train_ratio))
-    n_train = max(1, min(n - 1, n_train))
-    n_val = n - n_train
 
-    if n_val < 1:
-        n_val = 1
-        n_train = n - 1
+def make_volume_split_map(volume_dirs, eval_ratio: float, seed: int):
+    unique_volumes = sorted(set(volume_dirs), key=lambda p: str(p))
+    if not unique_volumes:
+        raise ValueError("No volumes found.")
 
-    split_map = {}
-    for i, key in enumerate(unique_keys):
-        if i < n_train:
-            split_map[key] = "train"
-        else:
-            split_map[key] = "val"
+    rng = random.Random(seed)
+    rng.shuffle(unique_volumes)
 
-    return split_map
+    if len(unique_volumes) == 1:
+        return {unique_volumes[0]: "train"}
+
+    n_eval = int(round(len(unique_volumes) * eval_ratio))
+    n_eval = max(1, min(len(unique_volumes) - 1, n_eval))
+    eval_volumes = set(unique_volumes[:n_eval])
+    return {
+        volume_dir: ("val" if volume_dir in eval_volumes else "train")
+        for volume_dir in unique_volumes
+    }
 
 
 def assign_writer_id(mode: str, volume_id: str, page_id: str):
@@ -261,26 +287,6 @@ def resolve_paths(args):
     return xml_root, images_root
 
 
-def find_page_xml_files(root: Path):
-    xml_files = []
-    for p in root.rglob("*.xml"):
-        parent_parts_lower = [part.lower() for part in p.parent.parts]
-        if "page" in parent_parts_lower:
-            xml_files.append(p)
-    return sorted(xml_files)
-
-
-def find_page_ancestor(path: Path, stop_root: Path) -> Path:
-    current = path.parent.resolve()
-    stop_root = stop_root.resolve()
-    while True:
-        if current.name.lower() == "page":
-            return current
-        if current == stop_root or current.parent == current:
-            return stop_root
-        current = current.parent
-
-
 def main():
     ap = argparse.ArgumentParser(description="Build polygon-masked line-crop manifest from PAGE-XML")
     ap.add_argument("--data-root", type=Path, default=None, help="Single root containing both XML and image files (recursive)")
@@ -290,8 +296,6 @@ def main():
     ap.add_argument("--manifest-name", default="lines_manifest.tsv")
     ap.add_argument("--image-exts", default=".jpg,.jpeg,.png,.tif,.tiff")
     ap.add_argument("--writer-mode", choices=["volume", "page", "volume_page"], default="volume")
-    ap.add_argument("--split-by", choices=["volume", "page"], default="volume")
-    ap.add_argument("--train-ratio", type=float, default=0.9)
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--min-text-len", type=int, default=1)
     ap.add_argument("--crop-pad", type=int, default=2)
@@ -299,12 +303,9 @@ def main():
     ap.add_argument("--background", choices=["transparent", "white"], default="transparent")
 
     args = ap.parse_args()
-    random.seed(args.seed)
-
-    if not (0.0 < args.train_ratio < 1.0):
-        raise ValueError("train_ratio must be > 0.0 and < 1.0")
 
     xml_root, images_root = resolve_paths(args)
+    xml_root = xml_root.resolve()
 
     args.out_root.mkdir(parents=True, exist_ok=True)
     crops_dir = args.out_root / "line_crops"
@@ -324,15 +325,11 @@ def main():
     if args.data_root is not None:
         basename_index = build_image_basename_index(args.data_root, exts)
 
-    # Build deterministic split map from all unique split keys
-    all_split_keys = []
-    for xml_path in xml_files:
-        volume_id = volume_id_from_stem(xml_path)
-        page_id = default_page_id(xml_path)
-        split_key = volume_id if args.split_by == "volume" else page_id
-        all_split_keys.append(split_key)
+    sampled_pages_by_volume = choose_sampled_pages_by_volume(xml_files, xml_root, args.seed)
+    volume_dirs = sorted(sampled_pages_by_volume, key=lambda p: str(p))
+    split_map = make_volume_split_map(volume_dirs, eval_ratio=EVAL_RATIO, seed=args.seed)
 
-    split_map = make_split_map(all_split_keys, args.train_ratio, args.seed)
+    print(f"Found {len(volume_dirs)} volumes (folders containing a page directory).")
 
     writer_vocab: dict[str, int] = {}
     writer_counts = defaultdict(int)
@@ -342,139 +339,138 @@ def main():
     n_missing_images = 0
     n_nonpage_xml = 0
 
-    for xml_path in xml_files:
-        try:
-            image_filename, lines = extract_lines(xml_path)
-        except ET.ParseError as e:
-            print(f"[WARN] Skipping invalid XML: {xml_path} ({e})")
-            n_parse_errors += 1
-            continue
-        except Exception as e:
-            print(f"[WARN] Failed reading XML: {xml_path} ({e})")
-            n_parse_errors += 1
-            continue
+    for volume_dir, sampled_xml_files in sampled_pages_by_volume.items():
+        volume_id = volume_dir.name
+        split = split_map[volume_dir]
 
-        if image_filename is None and not lines:
-            n_nonpage_xml += 1
-            continue
+        for xml_path in sampled_xml_files:
+            try:
+                image_filename, lines = extract_lines(xml_path)
+            except ET.ParseError as e:
+                print(f"[WARN] Skipping invalid XML: {xml_path} ({e})")
+                n_parse_errors += 1
+                continue
+            except Exception as e:
+                print(f"[WARN] Failed reading XML: {xml_path} ({e})")
+                n_parse_errors += 1
+                continue
 
-        if not lines:
-            continue
+            if image_filename is None and not lines:
+                n_nonpage_xml += 1
+                continue
 
-        if args.data_root is not None:
-            pages_root = find_page_ancestor(xml_path, xml_root.resolve())
-        else:
-            pages_root = xml_root
+            if not lines:
+                continue
 
-        try:
-            rel_xml = xml_path.relative_to(pages_root)
-        except ValueError:
-            rel_xml = Path(xml_path.name)
+            if args.data_root is not None:
+                pages_root = find_page_ancestor(xml_path, xml_root)
+            else:
+                pages_root = xml_root
 
-        page_image = None
+            try:
+                rel_xml = xml_path.relative_to(pages_root)
+            except ValueError:
+                rel_xml = Path(xml_path.name)
 
-        if args.data_root is not None:
-            resolved = choose_image_for_xml_in_single_root(xml_path, image_filename, basename_index)
-            if resolved is not None and resolved.exists():
-                try:
-                    page_image = Image.open(resolved).convert("RGB")
-                except Exception as e:
-                    print(f"[WARN] Could not open image {resolved} for XML {xml_path}: {e}")
-                    page_image = None
-        else:
-            candidate_paths = []
-            if image_filename:
-                candidate_paths.append(images_root / rel_xml.parent / image_filename)
-                candidate_paths.append(images_root / image_filename)
+            page_image = None
 
-            if not candidate_paths:
-                candidate_paths.append(images_root / rel_xml.with_suffix(".jpg"))
-
-            for cand in candidate_paths:
-                if cand.exists() and cand.suffix.lower() in exts:
+            if args.data_root is not None:
+                resolved = choose_image_for_xml_in_single_root(xml_path, image_filename, basename_index)
+                if resolved is not None and resolved.exists():
                     try:
-                        page_image = Image.open(cand).convert("RGB")
-                        break
+                        page_image = Image.open(resolved).convert("RGB")
                     except Exception as e:
-                        print(f"[WARN] Could not open image {cand}: {e}")
+                        print(f"[WARN] Could not open image {resolved} for XML {xml_path}: {e}")
+                        page_image = None
+            else:
+                candidate_paths = []
+                if image_filename:
+                    candidate_paths.append(images_root / rel_xml.parent / image_filename)
+                    candidate_paths.append(images_root / image_filename)
 
-            if page_image is None:
-                stem = rel_xml.with_suffix("")
-                for ext in exts:
-                    cand = images_root / f"{stem}{ext}"
-                    if cand.exists():
+                if not candidate_paths:
+                    candidate_paths.append(images_root / rel_xml.with_suffix(".jpg"))
+
+                for cand in candidate_paths:
+                    if cand.exists() and cand.suffix.lower() in exts:
                         try:
                             page_image = Image.open(cand).convert("RGB")
                             break
                         except Exception as e:
                             print(f"[WARN] Could not open image {cand}: {e}")
 
-        if page_image is None:
-            print(f"[WARN] Missing page image for XML: {xml_path}")
-            n_missing_images += 1
-            continue
+                if page_image is None:
+                    stem = rel_xml.with_suffix("")
+                    for ext in exts:
+                        cand = images_root / f"{stem}{ext}"
+                        if cand.exists():
+                            try:
+                                page_image = Image.open(cand).convert("RGB")
+                                break
+                            except Exception as e:
+                                print(f"[WARN] Could not open image {cand}: {e}")
 
-        volume_id = volume_id_from_stem(xml_path)
-        page_id = default_page_id(xml_path)
-
-        split_key = volume_id if args.split_by == "volume" else page_id
-        split = split_map[split_key]
-
-        writer_key = assign_writer_id(args.writer_mode, volume_id, page_id)
-        if writer_key not in writer_vocab:
-            writer_vocab[writer_key] = len(writer_vocab)
-        writer_id = writer_vocab[writer_key]
-
-        for li, line in enumerate(lines):
-            txt = line["transcription"].strip()
-            if len(txt) < args.min_text_len:
+            if page_image is None:
+                print(f"[WARN] Missing page image for XML: {xml_path}")
+                n_missing_images += 1
                 continue
 
-            points = line["points"]
-            if len(points) < 3:
-                continue
+            page_id = default_page_id(xml_path)
+            writer_key = assign_writer_id(args.writer_mode, volume_id, page_id)
+            if writer_key not in writer_vocab:
+                writer_vocab[writer_key] = len(writer_vocab)
+            writer_id = writer_vocab[writer_key]
 
-            try:
-                crop, bbox_xyxy, shifted_polygon = polygon_crop_with_mask(
-                    page_image,
-                    points,
-                    pad=args.crop_pad,
-                    background=args.background,
+            for li, line in enumerate(lines):
+                txt = line["transcription"].strip()
+                if len(txt) < args.min_text_len:
+                    continue
+
+                points = line["points"]
+                if len(points) < 3:
+                    continue
+
+                try:
+                    crop, bbox_xyxy, _ = polygon_crop_with_mask(
+                        page_image,
+                        points,
+                        pad=args.crop_pad,
+                        background=args.background,
+                    )
+                except Exception as e:
+                    print(f"[WARN] Failed polygon crop for {xml_path} line {line.get('line_id', li)}: {e}")
+                    continue
+
+                x1, y1, x2, y2 = bbox_xyxy
+                if x2 <= x1 or y2 <= y1:
+                    continue
+
+                line_id = line["line_id"] or f"line_{li:05d}"
+
+                rel_crop = Path("line_crops") / split / volume_id / f"{page_id}__{line_id}.png"
+                abs_crop = args.out_root / rel_crop
+                abs_crop.parent.mkdir(parents=True, exist_ok=True)
+                crop.save(abs_crop)
+
+                poly_global = " ".join(f"{x},{y}" for x, y in points)
+                bbox = f"{x1},{y1},{x2},{y2}"
+
+                image_path_field = rel_crop.as_posix() if args.relative_paths else str(abs_crop)
+                xml_path_field = rel_xml.as_posix() if args.relative_paths else str(xml_path)
+
+                rows_out.append(
+                    {
+                        "split": split,
+                        "image_path": image_path_field,
+                        "xml_path": xml_path_field,
+                        "line_id": line_id,
+                        "writer_id": writer_id,
+                        "transcription": txt,
+                        "bbox_xyxy": bbox,
+                        "polygon_xy": poly_global,
+                    }
                 )
-            except Exception as e:
-                print(f"[WARN] Failed polygon crop for {xml_path} line {line.get('line_id', li)}: {e}")
-                continue
-
-            x1, y1, x2, y2 = bbox_xyxy
-            if x2 <= x1 or y2 <= y1:
-                continue
-
-            line_id = line["line_id"] or f"line_{li:05d}"
-
-            rel_crop = Path("line_crops") / split / volume_id / f"{page_id}__{line_id}.png"
-            abs_crop = args.out_root / rel_crop
-            abs_crop.parent.mkdir(parents=True, exist_ok=True)
-            crop.save(abs_crop)
-
-            poly_global = " ".join(f"{x},{y}" for x, y in points)
-            bbox = f"{x1},{y1},{x2},{y2}"
-
-            image_path_field = rel_crop.as_posix() if args.relative_paths else str(abs_crop)
-            xml_path_field = rel_xml.as_posix() if args.relative_paths else str(xml_path)
-
-            rows_out.append(
-                {
-                    "split": split,
-                    "image_path": image_path_field,
-                    "xml_path": xml_path_field,
-                    "line_id": line_id,
-                    "writer_id": writer_id,
-                    "transcription": txt,
-                    "bbox_xyxy": bbox,
-                    "polygon_xy": poly_global,
-                }
-            )
-            writer_counts[writer_id] += 1
+                writer_counts[writer_id] += 1
 
     manifest_path = args.out_root / args.manifest_name
     with manifest_path.open("w", encoding="utf-8", newline="") as f:
