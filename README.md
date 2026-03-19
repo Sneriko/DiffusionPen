@@ -100,16 +100,17 @@ python utils/pagexml_to_manifest.py \
   --data-root /data/historical_collection \
   --out-root /data/diffusionpen_lines \
   --writer-mode volume \
-  --split-by volume \
   --relative-paths
 ```
 
 `--data-root` recursively scans a single tree for both XML and image files, then pairs files by basename (XML filename stem ↔ image filename stem).
 (Alternative mode: pass separate `--xml-root` and `--images-root`.)
 
+The manifest builder now counts volumes as the folders that contain a `page/` directory, samples one pair of random consecutive pages per volume, and assigns 10% of those volumes to validation (`val`) with the remainder going to training.
+
 Output manifest (`lines_manifest.tsv`) columns (tab-separated):
 
-- `split` (`train|val|test`)
+- `split` (`train|val`)
 - `image_path` (line crop path)
 - `xml_path` (source PAGE-XML path)
 - `line_id` (PAGE `TextLine/@id`)
