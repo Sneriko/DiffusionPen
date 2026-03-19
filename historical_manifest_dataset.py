@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence
 
-from PIL import Image, ImageOps
+from PIL import Image
 import torch
 from torch.utils.data import Dataset
 from torchvision import transforms
@@ -97,6 +97,8 @@ class BaseManifestDataset(Dataset):
         style_refs: int = 5,
         min_text_len: int = 1,
     ):
+        self.manifest_path = Path(manifest_path)
+        self.manifest_dir = self.manifest_path.resolve().parent
         all_rows = read_manifest(manifest_path, split=split)
         rows = [r for r in all_rows if len(r.transcription.strip()) >= min_text_len]
         if not rows:
@@ -133,7 +135,10 @@ class BaseManifestDataset(Dataset):
         return len(self.rows)
 
     def _load_image(self, path: str) -> Image.Image:
-        img = Image.open(path)
+        image_path = Path(path)
+        if not image_path.is_absolute():
+            image_path = self.manifest_dir / image_path
+        img = Image.open(image_path)
         if self.grayscale:
             img = img.convert("L")
             img = Image.merge("RGB", (img, img, img))
