@@ -9,8 +9,9 @@ This version:
 - ignores ALTO XML
 - matches images by PAGE imageFilename or basename
 - treats each volume (folder containing the page directory) as one hand
-- samples exactly two random consecutive pages per volume when available
-- assigns 10% of volumes to eval/val and the rest to train
+- samples up to 10 random consecutive pages per volume when available
+- keeps sampled pages from the same volume under one pseudo-style/writer when using --writer-mode volume
+- assigns the final 10% of sampled pages from each volume to val so writer IDs are shared across train/val
 - crops by polygon, not simple bbox
 - masks out everything outside the polygon
 - saves RGBA PNGs with transparent background by default
@@ -29,6 +30,7 @@ from PIL import Image, ImageDraw
 
 
 EVAL_RATIO = 0.1
+MAX_PAGES_PER_VOLUME = 10
 
 
 def find_with_ns(root: ET.Element, tag: str):
@@ -170,7 +172,7 @@ def infer_volume_dir(xml_path: Path, stop_root: Path) -> Path:
     return xml_path.parent
 
 
-def choose_sampled_pages_by_volume(xml_files, xml_root: Path, seed: int):
+def choose_sampled_pages_by_volume(xml_files, xml_root: Path, seed: int, max_pages: int):
     grouped = defaultdict(list)
     for xml_path in xml_files:
         volume_dir = infer_volume_dir(xml_path, xml_root)
@@ -180,34 +182,32 @@ def choose_sampled_pages_by_volume(xml_files, xml_root: Path, seed: int):
     sampled = {}
     for volume_dir, pages in grouped.items():
         ordered_pages = sorted(pages)
-        if len(ordered_pages) <= 2:
+        if len(ordered_pages) <= max_pages:
             sampled[volume_dir] = ordered_pages
             continue
 
-        start_idx = rng.randint(0, len(ordered_pages) - 2)
-        sampled[volume_dir] = ordered_pages[start_idx : start_idx + 2]
+        start_idx = rng.randint(0, len(ordered_pages) - max_pages)
+        sampled[volume_dir] = ordered_pages[start_idx : start_idx + max_pages]
 
     return sampled
 
 
-def make_volume_split_map(volume_dirs, eval_ratio: float, seed: int):
-    unique_volumes = sorted(set(volume_dirs), key=lambda p: str(p))
-    if not unique_volumes:
-        raise ValueError("No volumes found.")
+def make_page_split_map(sampled_pages_by_volume, eval_ratio: float):
+    split_map = {}
+    for volume_dir, pages in sampled_pages_by_volume.items():
+        ordered_pages = sorted(pages)
+        if len(ordered_pages) == 1:
+            split_map[ordered_pages[0]] = "train"
+            continue
 
-    rng = random.Random(seed)
-    rng.shuffle(unique_volumes)
+        n_eval = int(round(len(ordered_pages) * eval_ratio))
+        n_eval = max(1, min(len(ordered_pages) - 1, n_eval))
+        first_val_idx = len(ordered_pages) - n_eval
 
-    if len(unique_volumes) == 1:
-        return {unique_volumes[0]: "train"}
+        for i, xml_path in enumerate(ordered_pages):
+            split_map[xml_path] = "val" if i >= first_val_idx else "train"
 
-    n_eval = int(round(len(unique_volumes) * eval_ratio))
-    n_eval = max(1, min(len(unique_volumes) - 1, n_eval))
-    eval_volumes = set(unique_volumes[:n_eval])
-    return {
-        volume_dir: ("val" if volume_dir in eval_volumes else "train")
-        for volume_dir in unique_volumes
-    }
+    return split_map
 
 
 def assign_writer_id(mode: str, volume_id: str, page_id: str):
@@ -297,6 +297,7 @@ def main():
     ap.add_argument("--image-exts", default=".jpg,.jpeg,.png,.tif,.tiff")
     ap.add_argument("--writer-mode", choices=["volume", "page", "volume_page"], default="volume")
     ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--max-pages-per-volume", type=int, default=MAX_PAGES_PER_VOLUME)
     ap.add_argument("--min-text-len", type=int, default=1)
     ap.add_argument("--crop-pad", type=int, default=2)
     ap.add_argument("--relative-paths", action="store_true", help="Store relative paths in manifest")
@@ -325,9 +326,9 @@ def main():
     if args.data_root is not None:
         basename_index = build_image_basename_index(args.data_root, exts)
 
-    sampled_pages_by_volume = choose_sampled_pages_by_volume(xml_files, xml_root, args.seed)
+    sampled_pages_by_volume = choose_sampled_pages_by_volume(xml_files, xml_root, args.seed, args.max_pages_per_volume)
     volume_dirs = sorted(sampled_pages_by_volume, key=lambda p: str(p))
-    split_map = make_volume_split_map(volume_dirs, eval_ratio=EVAL_RATIO, seed=args.seed)
+    split_map = make_page_split_map(sampled_pages_by_volume, eval_ratio=EVAL_RATIO)
 
     print(f"Found {len(volume_dirs)} volumes (folders containing a page directory).")
 
@@ -341,9 +342,9 @@ def main():
 
     for volume_dir, sampled_xml_files in sampled_pages_by_volume.items():
         volume_id = volume_dir.name
-        split = split_map[volume_dir]
 
         for xml_path in sampled_xml_files:
+            split = split_map[xml_path]
             try:
                 image_filename, lines = extract_lines(xml_path)
             except ET.ParseError as e:
