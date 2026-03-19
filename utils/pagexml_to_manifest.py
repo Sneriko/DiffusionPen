@@ -275,6 +275,22 @@ def choose_image_for_xml_in_single_root(
     return scored[0][3]
 
 
+def ensure_train_writers_present(rows_out):
+    train_writers = {row["writer_id"] for row in rows_out if row["split"] == "train"}
+    moved_writer_ids = sorted({row["writer_id"] for row in rows_out if row["split"] == "val" and row["writer_id"] not in train_writers})
+    if not moved_writer_ids:
+        return 0, []
+
+    moved_writer_set = set(moved_writer_ids)
+    moved_rows = 0
+    for row in rows_out:
+        if row["split"] == "val" and row["writer_id"] in moved_writer_set:
+            row["split"] = "train"
+            moved_rows += 1
+
+    return moved_rows, moved_writer_ids
+
+
 def resolve_paths(args):
     if args.data_root is not None:
         xml_root = args.data_root
@@ -473,6 +489,8 @@ def main():
                 )
                 writer_counts[writer_id] += 1
 
+    moved_rows, moved_writer_ids = ensure_train_writers_present(rows_out)
+
     manifest_path = args.out_root / args.manifest_name
     with manifest_path.open("w", encoding="utf-8", newline="") as f:
         writer = csv.DictWriter(
@@ -502,6 +520,12 @@ def main():
     split_counts = defaultdict(int)
     for row in rows_out:
         split_counts[row["split"]] += 1
+
+    if moved_writer_ids:
+        print(
+            f"Adjusted split assignment for {len(moved_writer_ids)} writers with no surviving train rows; "
+            f"moved {moved_rows} validation rows to train."
+        )
 
     print("Split counts:")
     print(f"  train: {split_counts['train']}")

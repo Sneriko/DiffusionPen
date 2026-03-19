@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import random
+import warnings
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
@@ -96,6 +97,7 @@ class BaseManifestDataset(Dataset):
         writer_to_label: Optional[Dict[str, int]] = None,
         style_refs: int = 5,
         min_text_len: int = 1,
+        unknown_writer_behavior: str = "error",
     ):
         self.manifest_path = Path(manifest_path)
         self.manifest_dir = self.manifest_path.resolve().parent
@@ -110,6 +112,7 @@ class BaseManifestDataset(Dataset):
         self.grayscale = grayscale
         self.style_refs = style_refs
         self.split = split
+        self.unknown_writer_behavior = unknown_writer_behavior
 
         if writer_to_label is None:
             self.writer_to_label = self.index.writer_to_label
@@ -117,7 +120,26 @@ class BaseManifestDataset(Dataset):
             self.writer_to_label = dict(writer_to_label)
             unknown = sorted({r.writer_id for r in self.rows if r.writer_id not in self.writer_to_label})
             if unknown:
-                raise ValueError(f"Split {split!r} contains writer_ids not seen in training: {unknown[:10]}")
+                if unknown_writer_behavior == "error":
+                    raise ValueError(f"Split {split!r} contains writer_ids not seen in training: {unknown[:10]}")
+                if unknown_writer_behavior != "filter":
+                    raise ValueError(
+                        f"Unsupported unknown_writer_behavior={unknown_writer_behavior!r}; expected 'error' or 'filter'"
+                    )
+
+                unknown_set = set(unknown)
+                kept_rows = [r for r in self.rows if r.writer_id in self.writer_to_label]
+                dropped = len(self.rows) - len(kept_rows)
+                if not kept_rows:
+                    raise ValueError(
+                        f"No usable rows remain in split={split!r} after filtering unseen writer_ids: {unknown[:10]}"
+                    )
+                warnings.warn(
+                    f"Split {split!r} contains {len(unknown)} unseen writer_ids; filtered {dropped} rows from validation: {unknown[:10]}",
+                    stacklevel=2,
+                )
+                self.rows = kept_rows
+                self.index = ManifestIndex(self.rows)
 
         mean = (0.5, 0.5, 0.5)
         std = (0.5, 0.5, 0.5)
@@ -234,5 +256,6 @@ def make_train_val_datasets(
         grayscale=grayscale,
         style_refs=style_refs,
         writer_to_label=train_ds.writer_to_label,
+        unknown_writer_behavior="filter",
     )
     return train_ds, val_ds
