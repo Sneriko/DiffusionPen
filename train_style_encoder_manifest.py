@@ -17,12 +17,24 @@ class MixedEncoder(nn.Module):
     def __init__(self, model_name: str, num_classes: int, pretrained: bool = True, trainable: bool = True):
         super().__init__()
         self.backbone = ImageEncoder(model_name=model_name, num_classes=num_classes, pretrained=pretrained, trainable=trainable)
+        self.encoder = self.backbone.model
 
     def forward(self, x):
-        out = self.backbone(x)
-        if isinstance(out, tuple) and len(out) == 2:
-            return out
-        raise ValueError("ImageEncoder is expected to return (logits, features) for style training.")
+        if hasattr(self.encoder, "forward_features") and hasattr(self.encoder, "forward_head"):
+            feature_maps = self.encoder.forward_features(x)
+            features = self.encoder.forward_head(feature_maps, pre_logits=True)
+            logits = self.encoder.forward_head(feature_maps)
+
+            if not isinstance(features, torch.Tensor):
+                raise TypeError("ImageEncoder forward_head(..., pre_logits=True) must return a tensor.")
+            if features.ndim > 2:
+                features = features.flatten(1)
+            return logits, features
+
+        logits = self.backbone(x)
+        if isinstance(logits, torch.Tensor):
+            return logits, logits
+        raise ValueError("ImageEncoder must return logits as a tensor for style training.")
 
 
 def run_epoch(loader, model, optimizer, device, triplet_loss_fn, ce_loss_fn, train: bool):
