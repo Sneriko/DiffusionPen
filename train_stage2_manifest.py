@@ -194,6 +194,8 @@ def main():
     ap.add_argument("--num-heads", type=int, default=4)
     ap.add_argument("--num-res-blocks", type=int, default=1)
     ap.add_argument("--lr", type=float, default=1e-4)
+    ap.add_argument("--interpolation", action="store_true", help="Enable style interpolation path in UNet")
+    ap.add_argument("--mix-rate", type=float, default=None, help="Interpolation mix rate when --interpolation is enabled")
     args = ap.parse_args()
 
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
