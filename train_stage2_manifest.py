@@ -148,18 +148,13 @@ def run_train_epoch(loader, model, ema, ema_model, vae, optimizer, mse_loss, noi
 
 
 @torch.no_grad()
-def initialize_unet_with_sample_batch(loader, model, vae, noise_scheduler, style_extractor, tokenizer, device, latent=True):
+def initialize_unet_lazy_layers(loader, model, style_extractor, device):
     """
-    Materialize lazy parameters (e.g. nn.LazyLinear) with a single dry forward pass.
-    This must run before creating optimizer/EMA state that touches model parameters.
+    Materialize UNet lazy parameters with a lightweight pass.
+    We only initialize lazy layers that depend on style feature width to avoid an expensive
+    full UNet forward (which can be quadratic in spatial token count and OOM at large widths).
     """
-    was_training = model.training
-    model.eval()
-
     batch = next(iter(loader))
-    images = batch["image"].to(device)
-    transcr = list(batch["transcription"])
-    labels = batch["writer_label"].to(device)
     style_images = batch["style_images"].to(device)
 
     bsz, k, c, h, w = style_images.shape
@@ -170,19 +165,10 @@ def initialize_unet_with_sample_batch(loader, model, vae, noise_scheduler, style
     else:
         style_feat = style_out
     style_features = style_feat.view(bsz, k, -1).mean(dim=1)
-
-    text_features = tokenizer(transcr, padding="max_length", truncation=True, return_tensors="pt", max_length=256).to(device)
-
-    if latent:
-        images = vae.encode(images.to(torch.float32)).latent_dist.sample() * 0.18215
-
-    noise = torch.randn_like(images)
-    timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (images.size(0),), device=device).long()
-    noisy_images = noise_scheduler.add_noise(images, noise, timesteps)
-    _ = model(noisy_images, timesteps=timesteps, context=text_features, y=labels, style_extractor=style_features)
-
-    if was_training:
-        model.train()
+    # `style_lin` is currently the only lazy layer in UNet that needs feature-shape materialization.
+    style_lin = getattr(model, "style_lin", None)
+    if isinstance(style_lin, nn.modules.lazy.LazyModuleMixin) and style_lin.has_uninitialized_params():
+        _ = style_lin(style_features)
 
 
 @torch.no_grad()
@@ -301,7 +287,7 @@ def main():
         vae = None
 
     ddim = DDIMScheduler.from_pretrained(stable_dif_source, subfolder="scheduler")
-    initialize_unet_with_sample_batch(train_loader, unet, vae, ddim, style_extractor, tokenizer, device, latent=args.latent)
+    initialize_unet_lazy_layers(train_loader, unet, style_extractor, device)
 
     optimizer = optim.AdamW(unet.parameters(), lr=args.lr)
     mse_loss = nn.MSELoss()
