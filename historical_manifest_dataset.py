@@ -1,14 +1,15 @@
 from __future__ import annotations
 
 import csv
+import json
 import random
 import warnings
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence
+from typing import Dict, List, Optional, Sequence, Tuple
 
-from PIL import Image
+from PIL import Image, ImageDraw
 import torch
 from torch.utils.data import Dataset
 from torchvision import transforms
@@ -28,6 +29,41 @@ def resize_keep_aspect(img: Image.Image, target_h: int, target_w: int, pad_color
     y = (target_h - new_h) // 2
     canvas.paste(img, (x, y))
     return canvas
+
+
+def parse_polygon_xy(polygon_xy: str) -> List[Tuple[float, float]]:
+    """
+    Parse polygon strings from manifest.
+    Supported formats:
+    - "x1,y1 x2,y2 ..."
+    - JSON-ish list: [[x1, y1], [x2, y2], ...]
+    """
+    polygon_xy = (polygon_xy or "").strip()
+    if not polygon_xy:
+        return []
+
+    if polygon_xy.startswith("["):
+        try:
+            raw = json.loads(polygon_xy)
+            pts = []
+            for item in raw:
+                if not isinstance(item, (list, tuple)) or len(item) != 2:
+                    continue
+                pts.append((float(item[0]), float(item[1])))
+            return pts
+        except json.JSONDecodeError:
+            return []
+
+    points: List[Tuple[float, float]] = []
+    for token in polygon_xy.split():
+        if "," not in token:
+            continue
+        x_str, y_str = token.split(",", 1)
+        try:
+            points.append((float(x_str), float(y_str)))
+        except ValueError:
+            continue
+    return points
 
 
 @dataclass
@@ -168,6 +204,25 @@ class BaseManifestDataset(Dataset):
             img = img.convert("RGB")
         return resize_keep_aspect(img, self.image_height, self.image_width)
 
+    def _load_masked_image(self, row: ManifestRow) -> Image.Image:
+        image_path = Path(row.image_path)
+        if not image_path.is_absolute():
+            image_path = self.manifest_dir / image_path
+        img = Image.open(image_path).convert("RGB")
+
+        points = parse_polygon_xy(row.polygon_xy)
+        if len(points) >= 3:
+            mask = Image.new("L", img.size, 0)
+            draw = ImageDraw.Draw(mask)
+            draw.polygon(points, fill=255)
+            white_bg = Image.new("RGB", img.size, (255, 255, 255))
+            img = Image.composite(img, white_bg, mask)
+
+        if self.grayscale:
+            img = img.convert("L")
+            img = Image.merge("RGB", (img, img, img))
+        return resize_keep_aspect(img, self.image_height, self.image_width)
+
     def _sample_positive_index(self, idx: int) -> int:
         row = self.rows[idx]
         candidates = self.writer_to_indices[row.writer_id]
@@ -218,8 +273,8 @@ class Stage2ManifestDataset(BaseManifestDataset):
         row = self.rows[idx]
         style_indices = self._sample_style_indices(idx, self.style_refs)
 
-        image = self.transform(self._load_image(row.image_path))
-        style_images = torch.stack([self.transform(self._load_image(self.rows[j].image_path)) for j in style_indices], dim=0)
+        image = self.transform(self._load_masked_image(row))
+        style_images = torch.stack([self.transform(self._load_masked_image(self.rows[j])) for j in style_indices], dim=0)
         writer_label = self.writer_to_label[row.writer_id]
 
         return {
@@ -229,6 +284,7 @@ class Stage2ManifestDataset(BaseManifestDataset):
             "writer_id": row.writer_id,
             "style_images": style_images,
             "image_path": row.image_path,
+            "style_image_paths": [self.rows[j].image_path for j in style_indices],
         }
 
 

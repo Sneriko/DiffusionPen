@@ -12,7 +12,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 import torchvision
 from torchvision import transforms
-from PIL import Image
+from PIL import Image, ImageDraw
 from diffusers import AutoencoderKL, DDIMScheduler
 from transformers import CanineTokenizer, CanineModel
 
@@ -92,6 +92,68 @@ def save_images(images, path):
     im = transforms.ToPILImage()(grid.cpu())
     im.save(path)
     return im
+
+
+def tensor_to_pil(image_tensor: torch.Tensor) -> Image.Image:
+    image_tensor = image_tensor.detach().cpu()
+    image_tensor = (image_tensor * 0.5 + 0.5).clamp(0, 1)
+    return transforms.ToPILImage()(image_tensor)
+
+
+def save_eval_bundle(generated, batch, path: Path):
+    """
+    Save a side-by-side eval preview with:
+    [style reference | target source line image | generated sample]
+    and write captions with prompt text and style-image source path.
+    """
+    bsz = generated.size(0)
+    style_ref = batch["style_images"][:, 0]  # first style reference per sample
+    target_src = batch["image"]
+    texts = list(batch["transcription"])
+    style_paths = batch.get("style_image_paths", [[] for _ in range(bsz)])
+    target_paths = batch.get("image_path", [""] * bsz)
+
+    rows = []
+    row_h = 0
+    row_w = 0
+    for i in range(bsz):
+        style_im = tensor_to_pil(style_ref[i])
+        target_im = tensor_to_pil(target_src[i])
+        gen_im = transforms.ToPILImage()(generated[i].clamp(0, 1))
+        if gen_im.mode != "RGB":
+            gen_im = gen_im.convert("RGB")
+
+        w, h = style_im.size
+        strip = Image.new("RGB", (w * 3 + 8, h), "white")
+        strip.paste(style_im, (0, 0))
+        strip.paste(target_im, (w + 4, 0))
+        strip.paste(gen_im.resize((w, h), resample=Image.Resampling.BILINEAR), (2 * w + 8, 0))
+        rows.append(strip)
+        row_h = h
+        row_w = strip.size[0]
+
+    caption_h = 64
+    canvas = Image.new("RGB", (row_w, (row_h + caption_h) * bsz), "white")
+    draw = ImageDraw.Draw(canvas)
+    for i, strip in enumerate(rows):
+        y0 = i * (row_h + caption_h)
+        canvas.paste(strip, (0, y0))
+        style_path = style_paths[i][0] if style_paths[i] else ""
+        caption = (
+            f'text="{texts[i]}" | style_src="{style_path}" | target_src="{target_paths[i]}" '
+            "| cols=[style,target,generated]"
+        )
+        draw.text((4, y0 + row_h + 4), caption, fill="black")
+
+    canvas.save(path)
+
+    meta_path = path.with_suffix(".txt")
+    with meta_path.open("w", encoding="utf-8") as f:
+        for i in range(bsz):
+            style_path = style_paths[i][0] if style_paths[i] else ""
+            f.write(f"[{i}] text={texts[i]}\n")
+            f.write(f"    style_source={style_path}\n")
+            f.write(f"    target_source={target_paths[i]}\n")
 
 
 def load_style_extractor(style_checkpoint: str, device: torch.device):
@@ -350,6 +412,7 @@ def main():
                 latent=args.latent,
             )
             save_images(sampled, preview_path / f"epoch_{epoch:04d}.png")
+            save_eval_bundle(sampled, preview_batch, preview_path / f"epoch_{epoch:04d}_bundle.png")
 
 
 if __name__ == "__main__":
