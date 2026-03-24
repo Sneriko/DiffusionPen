@@ -1241,8 +1241,9 @@ class UNetModel(nn.Module):
         
         self.interpolation = args.interpolation
         self.mix_rate = args.mix_rate
-        #self.style_lin = nn.Linear(1280*5, time_embed_dim)
-        self.style_lin = nn.Linear(1280, time_embed_dim)
+        # Style encoder feature width depends on the encoder checkpoint.
+        # Use a lazy projection so stage-2 training can consume any feature size.
+        self.style_lin = nn.LazyLinear(time_embed_dim)
         self.target_token_idx = 0
         self.text_lin = nn.Linear(768, 320)
     
@@ -1305,11 +1306,11 @@ class UNetModel(nn.Module):
             emb = emb + y  
         else:
             if style_extractor is not None:
-                
-                b, e = emb.shape
-                
-                y = y.reshape(b, 5, -1)
-                y = torch.mean(y, dim=1)
+                # Accept either [B, K, D] style references or pre-aggregated [B, D].
+                if y.dim() == 3:
+                    y = y.mean(dim=1)
+                elif y.dim() != 2:
+                    raise ValueError(f"Expected style features with shape [B, D] or [B, K, D], got {tuple(y.shape)}")
 
                 noise=False
                 if noise==True:
@@ -1358,7 +1359,6 @@ class UNetModel(nn.Module):
         else:
             
             return self.out(h)
-
 
 
 
