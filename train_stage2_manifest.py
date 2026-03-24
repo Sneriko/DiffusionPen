@@ -209,6 +209,23 @@ def sample_preview(ema_model, vae, batch, style_extractor, tokenizer, scheduler,
     return image.cpu()
 
 
+@torch.no_grad()
+def sample_preview_from_checkpoint(
+    ema_model,
+    checkpoint_path: Path,
+    vae,
+    batch,
+    style_extractor,
+    tokenizer,
+    scheduler,
+    device,
+    latent=True,
+):
+    state = torch.load(checkpoint_path, map_location=device)
+    ema_model.load_state_dict(state)
+    return sample_preview(ema_model, vae, batch, style_extractor, tokenizer, scheduler, device, latent=latent)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--manifest", required=True)
@@ -299,27 +316,40 @@ def main():
     ema_path = Path(args.save_path) / "models" / "ema_ckpt.pt"
     preview_path = Path(args.save_path) / "images"
 
+    meta_path = Path(args.save_path) / "models" / "meta.pt"
+    torch.save(
+        {
+            "writer_to_label": writer_to_label,
+            "image_height": args.image_height,
+            "image_width": args.image_width,
+            "grayscale": args.grayscale,
+        },
+        meta_path,
+    )
+
     for epoch in range(1, args.epochs + 1):
         train_loss = run_train_epoch(
             train_loader, unet, ema, ema_model, vae, optimizer, mse_loss, ddim, style_extractor, tokenizer, device, latent=args.latent
         )
         print(f"Epoch {epoch}/{args.epochs} | train mse={train_loss:.6f}")
 
-        if epoch % 10 == 0:
+        torch.save(unet.state_dict(), best_path)
+        torch.save(ema_model.state_dict(), ema_path)
+
+        if len(val_ds) > 0:
             preview_batch = next(iter(val_loader))
-            sampled = sample_preview(ema_model, vae, preview_batch, style_extractor, tokenizer, ddim, device, latent=args.latent)
-            save_images(sampled, preview_path / f"epoch_{epoch:04d}.png")
-            torch.save(unet.state_dict(), best_path)
-            torch.save(ema_model.state_dict(), ema_path)
-            torch.save(
-                {
-                    "writer_to_label": writer_to_label,
-                    "image_height": args.image_height,
-                    "image_width": args.image_width,
-                    "grayscale": args.grayscale,
-                },
-                Path(args.save_path) / "models" / "meta.pt",
+            sampled = sample_preview_from_checkpoint(
+                ema_model,
+                ema_path,
+                vae,
+                preview_batch,
+                style_extractor,
+                tokenizer,
+                ddim,
+                device,
+                latent=args.latent,
             )
+            save_images(sampled, preview_path / f"epoch_{epoch:04d}.png")
 
 
 if __name__ == "__main__":
