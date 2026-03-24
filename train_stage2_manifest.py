@@ -110,8 +110,32 @@ def save_eval_bundle(generated, batch, path: Path):
     style_ref = batch["style_images"][:, 0]  # first style reference per sample
     target_src = batch["image"]
     texts = list(batch["transcription"])
-    style_paths = batch.get("style_image_paths", [[] for _ in range(bsz)])
+    style_paths_raw = batch.get("style_image_paths", [[] for _ in range(bsz)])
     target_paths = batch.get("image_path", [""] * bsz)
+
+    # Default DataLoader collate transposes list-valued fields:
+    # list[list[str]] (per-sample) -> list[tuple[str, ...]] (per-style-slot).
+    # Normalize back to per-sample lists for robust caption rendering.
+    style_paths = [[] for _ in range(bsz)]
+    if isinstance(style_paths_raw, (list, tuple)):
+        if len(style_paths_raw) == bsz:
+            for i in range(bsz):
+                cur = style_paths_raw[i]
+                if isinstance(cur, (list, tuple)):
+                    style_paths[i] = [str(x) for x in cur]
+                elif cur:
+                    style_paths[i] = [str(cur)]
+        elif len(style_paths_raw) > 0:
+            transposed_rows = []
+            for slot in style_paths_raw:
+                if isinstance(slot, (list, tuple)):
+                    transposed_rows.append(list(slot))
+                else:
+                    transposed_rows.append([slot])
+            for i, per_sample in enumerate(zip(*transposed_rows)):
+                if i >= bsz:
+                    break
+                style_paths[i] = [str(x) for x in per_sample if x]
 
     rows = []
     row_h = 0
@@ -388,6 +412,22 @@ def main():
         },
         meta_path,
     )
+
+    if len(val_ds) > 0:
+        preview_batch = next(iter(val_loader))
+        sampled = sample_preview(
+            ema_model,
+            vae,
+            preview_batch,
+            style_extractor,
+            tokenizer,
+            ddim,
+            device,
+            latent=args.latent,
+        )
+        save_images(sampled, preview_path / "epoch_0000.png")
+        save_eval_bundle(sampled, preview_batch, preview_path / "epoch_0000_bundle.png")
+        print("Pre-training eval complete | saved epoch_0000 previews")
 
     for epoch in range(1, args.epochs + 1):
         train_loss = run_train_epoch(
