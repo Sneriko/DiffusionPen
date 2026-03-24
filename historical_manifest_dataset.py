@@ -66,6 +66,22 @@ def parse_polygon_xy(polygon_xy: str) -> List[Tuple[float, float]]:
     return points
 
 
+def parse_bbox_xyxy(bbox_xyxy: str) -> Optional[Tuple[float, float, float, float]]:
+    bbox_xyxy = (bbox_xyxy or "").strip()
+    if not bbox_xyxy:
+        return None
+    parts = bbox_xyxy.split(",")
+    if len(parts) != 4:
+        return None
+    try:
+        x1, y1, x2, y2 = [float(v) for v in parts]
+    except ValueError:
+        return None
+    if x2 <= x1 or y2 <= y1:
+        return None
+    return x1, y1, x2, y2
+
+
 @dataclass
 class ManifestRow:
     split: str
@@ -211,6 +227,14 @@ class BaseManifestDataset(Dataset):
         img = Image.open(image_path).convert("RGB")
 
         points = parse_polygon_xy(row.polygon_xy)
+        bbox = parse_bbox_xyxy(row.bbox_xyxy)
+        if len(points) >= 3 and bbox is not None:
+            # Manifest rows store crops in image_path but polygon points in full-page coordinates.
+            # Convert polygons to local crop coordinates before masking.
+            x1, y1, _, _ = bbox
+            local_points = [(x - x1, y - y1) for x, y in points]
+            points = local_points
+
         if len(points) >= 3:
             mask = Image.new("L", img.size, 0)
             draw = ImageDraw.Draw(mask)
