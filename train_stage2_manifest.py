@@ -148,6 +148,44 @@ def run_train_epoch(loader, model, ema, ema_model, vae, optimizer, mse_loss, noi
 
 
 @torch.no_grad()
+def initialize_unet_with_sample_batch(loader, model, vae, noise_scheduler, style_extractor, tokenizer, device, latent=True):
+    """
+    Materialize lazy parameters (e.g. nn.LazyLinear) with a single dry forward pass.
+    This must run before creating optimizer/EMA state that touches model parameters.
+    """
+    was_training = model.training
+    model.eval()
+
+    batch = next(iter(loader))
+    images = batch["image"].to(device)
+    transcr = list(batch["transcription"])
+    labels = batch["writer_label"].to(device)
+    style_images = batch["style_images"].to(device)
+
+    bsz, k, c, h, w = style_images.shape
+    style_flat = style_images.view(bsz * k, c, h, w)
+    style_out = style_extractor(style_flat)
+    if isinstance(style_out, tuple):
+        _, style_feat = style_out
+    else:
+        style_feat = style_out
+    style_features = style_feat.view(bsz, k, -1).mean(dim=1)
+
+    text_features = tokenizer(transcr, padding="max_length", truncation=True, return_tensors="pt", max_length=256).to(device)
+
+    if latent:
+        images = vae.encode(images.to(torch.float32)).latent_dist.sample() * 0.18215
+
+    noise = torch.randn_like(images)
+    timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (images.size(0),), device=device).long()
+    noisy_images = noise_scheduler.add_noise(images, noise, timesteps)
+    _ = model(noisy_images, timesteps=timesteps, context=text_features, y=labels, style_extractor=style_features)
+
+    if was_training:
+        model.train()
+
+
+@torch.no_grad()
 def sample_preview(ema_model, vae, batch, style_extractor, tokenizer, scheduler, device, latent=True):
     ema_model.eval()
     style_images = batch["style_images"].to(device)
@@ -254,12 +292,6 @@ def main():
         args=args,
     ).to(device)
 
-    optimizer = optim.AdamW(unet.parameters(), lr=args.lr)
-    mse_loss = nn.MSELoss()
-    diffusion = Diffusion(img_size=(args.image_height, args.image_width), device=device)
-    ema = EMA(0.995)
-    ema_model = copy.deepcopy(unet).eval().requires_grad_(False)
-
     stable_dif_source = resolve_model_source(args.stable_dif_path)
 
     if args.latent:
@@ -269,6 +301,13 @@ def main():
         vae = None
 
     ddim = DDIMScheduler.from_pretrained(stable_dif_source, subfolder="scheduler")
+    initialize_unet_with_sample_batch(train_loader, unet, vae, ddim, style_extractor, tokenizer, device, latent=args.latent)
+
+    optimizer = optim.AdamW(unet.parameters(), lr=args.lr)
+    mse_loss = nn.MSELoss()
+    diffusion = Diffusion(img_size=(args.image_height, args.image_width), device=device)
+    ema = EMA(0.995)
+    ema_model = copy.deepcopy(unet).eval().requires_grad_(False)
 
     best_path = Path(args.save_path) / "models" / "ckpt.pt"
     ema_path = Path(args.save_path) / "models" / "ema_ckpt.pt"
