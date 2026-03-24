@@ -78,6 +78,15 @@ def setup_logging(save_path: str):
     os.makedirs(os.path.join(save_path, "images"), exist_ok=True)
 
 
+def resolve_model_source(model_path: str) -> str:
+    candidate = Path(model_path).expanduser().resolve()
+    if candidate.exists():
+        return str(candidate)
+    if model_path.startswith("./"):
+        return model_path[2:]
+    return model_path
+
+
 def save_images(images, path):
     grid = torchvision.utils.make_grid(images, padding=2)
     im = transforms.ToPILImage()(grid.cpu())
@@ -188,7 +197,7 @@ def main():
     ap.add_argument("--image-width", type=int, default=768)
     ap.add_argument("--grayscale", action="store_true")
     ap.add_argument("--device", default="cuda:0")
-    ap.add_argument("--stable-dif-path", default="./stable-diffusion-v1-5")
+    ap.add_argument("--stable-dif-path", default="stable-diffusion-v1-5")
     ap.add_argument("--latent", action="store_true")
     ap.add_argument("--emb-dim", type=int, default=320)
     ap.add_argument("--num-heads", type=int, default=4)
@@ -251,13 +260,15 @@ def main():
     ema = EMA(0.995)
     ema_model = copy.deepcopy(unet).eval().requires_grad_(False)
 
+    stable_dif_source = resolve_model_source(args.stable_dif_path)
+
     if args.latent:
-        vae = AutoencoderKL.from_pretrained(args.stable_dif_path, subfolder="vae").to(device)
+        vae = AutoencoderKL.from_pretrained(stable_dif_source, subfolder="vae").to(device)
         vae.eval().requires_grad_(False)
     else:
         vae = None
 
-    ddim = DDIMScheduler.from_pretrained(args.stable_dif_path, subfolder="scheduler")
+    ddim = DDIMScheduler.from_pretrained(stable_dif_source, subfolder="scheduler")
 
     best_path = Path(args.save_path) / "models" / "ckpt.pt"
     ema_path = Path(args.save_path) / "models" / "ema_ckpt.pt"
