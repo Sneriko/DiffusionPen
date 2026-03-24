@@ -148,6 +148,30 @@ def run_train_epoch(loader, model, ema, ema_model, vae, optimizer, mse_loss, noi
 
 
 @torch.no_grad()
+def initialize_unet_lazy_layers(loader, model, style_extractor, device):
+    """
+    Materialize UNet lazy parameters with a lightweight pass.
+    We only initialize lazy layers that depend on style feature width to avoid an expensive
+    full UNet forward (which can be quadratic in spatial token count and OOM at large widths).
+    """
+    batch = next(iter(loader))
+    style_images = batch["style_images"].to(device)
+
+    bsz, k, c, h, w = style_images.shape
+    style_flat = style_images.view(bsz * k, c, h, w)
+    style_out = style_extractor(style_flat)
+    if isinstance(style_out, tuple):
+        _, style_feat = style_out
+    else:
+        style_feat = style_out
+    style_features = style_feat.view(bsz, k, -1).mean(dim=1)
+    # `style_lin` is currently the only lazy layer in UNet that needs feature-shape materialization.
+    style_lin = getattr(model, "style_lin", None)
+    if isinstance(style_lin, nn.modules.lazy.LazyModuleMixin) and style_lin.has_uninitialized_params():
+        _ = style_lin(style_features)
+
+
+@torch.no_grad()
 def sample_preview(ema_model, vae, batch, style_extractor, tokenizer, scheduler, device, latent=True):
     ema_model.eval()
     style_images = batch["style_images"].to(device)
@@ -254,12 +278,6 @@ def main():
         args=args,
     ).to(device)
 
-    optimizer = optim.AdamW(unet.parameters(), lr=args.lr)
-    mse_loss = nn.MSELoss()
-    diffusion = Diffusion(img_size=(args.image_height, args.image_width), device=device)
-    ema = EMA(0.995)
-    ema_model = copy.deepcopy(unet).eval().requires_grad_(False)
-
     stable_dif_source = resolve_model_source(args.stable_dif_path)
 
     if args.latent:
@@ -269,6 +287,13 @@ def main():
         vae = None
 
     ddim = DDIMScheduler.from_pretrained(stable_dif_source, subfolder="scheduler")
+    initialize_unet_lazy_layers(train_loader, unet, style_extractor, device)
+
+    optimizer = optim.AdamW(unet.parameters(), lr=args.lr)
+    mse_loss = nn.MSELoss()
+    diffusion = Diffusion(img_size=(args.image_height, args.image_width), device=device)
+    ema = EMA(0.995)
+    ema_model = copy.deepcopy(unet).eval().requires_grad_(False)
 
     best_path = Path(args.save_path) / "models" / "ckpt.pt"
     ema_path = Path(args.save_path) / "models" / "ema_ckpt.pt"
