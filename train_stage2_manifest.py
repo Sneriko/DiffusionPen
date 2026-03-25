@@ -9,6 +9,7 @@ import torch
 import torch.nn as nn
 from torch import optim
 from torch.utils.data import DataLoader
+from torch.utils.data._utils.collate import default_collate
 from tqdm import tqdm
 import torchvision
 from torchvision import transforms
@@ -193,6 +194,33 @@ def load_style_extractor(style_checkpoint: str, device: torch.device):
     return feature_extractor, writer_to_label, ckpt
 
 
+def build_writer_diverse_preview_batch(dataset, max_samples: int):
+    """Build an eval preview batch with broad writer/hand coverage."""
+    if len(dataset) == 0:
+        raise ValueError("Cannot build preview batch from an empty dataset.")
+    if max_samples <= 0:
+        raise ValueError(f"max_samples must be > 0, got {max_samples}.")
+
+    max_samples = min(max_samples, len(dataset))
+    selected_indices = []
+
+    for writer_id in dataset.writer_ids:
+        if len(selected_indices) >= max_samples:
+            break
+        selected_indices.append(dataset.writer_to_indices[writer_id][0])
+
+    if len(selected_indices) < max_samples:
+        selected_set = set(selected_indices)
+        for idx in range(len(dataset)):
+            if len(selected_indices) >= max_samples:
+                break
+            if idx in selected_set:
+                continue
+            selected_indices.append(idx)
+
+    return default_collate([dataset[idx] for idx in selected_indices])
+
+
 def run_train_epoch(loader, model, ema, ema_model, vae, optimizer, mse_loss, noise_scheduler, style_extractor, tokenizer, device, latent=True):
     model.train()
     meter = AvgMeter("mse")
@@ -360,7 +388,6 @@ def main():
 
     num_classes = len(writer_to_label)
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers, pin_memory=True)
-    val_loader = DataLoader(val_ds, batch_size=min(args.batch_size, 8), shuffle=False, num_workers=args.num_workers, pin_memory=True)
 
     tokenizer = CanineTokenizer.from_pretrained("google/canine-c")
     text_encoder = CanineModel.from_pretrained("google/canine-c")
@@ -413,8 +440,9 @@ def main():
         meta_path,
     )
 
+    preview_batch_size = min(args.batch_size, 8)
     if len(val_ds) > 0:
-        preview_batch = next(iter(val_loader))
+        preview_batch = build_writer_diverse_preview_batch(val_ds, max_samples=preview_batch_size)
         sampled = sample_preview(
             ema_model,
             vae,
@@ -439,7 +467,7 @@ def main():
         torch.save(ema_model.state_dict(), ema_path)
 
         if len(val_ds) > 0:
-            preview_batch = next(iter(val_loader))
+            preview_batch = build_writer_diverse_preview_batch(val_ds, max_samples=preview_batch_size)
             sampled = sample_preview_from_checkpoint(
                 ema_model,
                 ema_path,
