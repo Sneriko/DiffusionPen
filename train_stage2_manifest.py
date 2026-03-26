@@ -360,6 +360,14 @@ def main():
     ap.add_argument("--lr", type=float, default=1e-4)
     ap.add_argument("--interpolation", action="store_true", help="Enable style interpolation path in UNet")
     ap.add_argument("--mix-rate", type=float, default=None, help="Interpolation mix rate when --interpolation is enabled")
+    ap.add_argument(
+        "--resume-path",
+        default=None,
+        help=(
+            "Path to a previous checkpoint file (ckpt.pt) or a models directory containing "
+            "ckpt.pt/ema_ckpt.pt/optim.pt/train_state.pt."
+        ),
+    )
     args = ap.parse_args()
 
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
@@ -427,6 +435,8 @@ def main():
 
     best_path = Path(args.save_path) / "models" / "ckpt.pt"
     ema_path = Path(args.save_path) / "models" / "ema_ckpt.pt"
+    optim_path = Path(args.save_path) / "models" / "optim.pt"
+    state_path = Path(args.save_path) / "models" / "train_state.pt"
     preview_path = Path(args.save_path) / "images"
 
     meta_path = Path(args.save_path) / "models" / "meta.pt"
@@ -441,6 +451,56 @@ def main():
     )
 
     preview_batch_size = min(args.batch_size, 8)
+    start_epoch = 1
+
+    if args.resume_path:
+        resume_path = Path(args.resume_path)
+        if resume_path.is_dir():
+            model_resume = resume_path / "ckpt.pt"
+            ema_resume = resume_path / "ema_ckpt.pt"
+            optim_resume = resume_path / "optim.pt"
+            state_resume = resume_path / "train_state.pt"
+        else:
+            model_resume = resume_path
+            ema_resume = resume_path.with_name("ema_ckpt.pt")
+            optim_resume = resume_path.with_name("optim.pt")
+            state_resume = resume_path.with_name("train_state.pt")
+
+        if not model_resume.exists():
+            raise FileNotFoundError(f"Could not find model checkpoint to resume from: {model_resume}")
+
+        model_state = torch.load(model_resume, map_location=device)
+        if isinstance(model_state, dict) and "model_state_dict" in model_state:
+            model_state = model_state["model_state_dict"]
+        unet.load_state_dict(model_state)
+        print(f"Resumed model weights from {model_resume}")
+
+        if ema_resume.exists():
+            ema_state = torch.load(ema_resume, map_location=device)
+            if isinstance(ema_state, dict) and "model_state_dict" in ema_state:
+                ema_state = ema_state["model_state_dict"]
+            ema_model.load_state_dict(ema_state)
+            print(f"Resumed EMA weights from {ema_resume}")
+        else:
+            ema_model.load_state_dict(unet.state_dict())
+            print("EMA checkpoint not found; initialized EMA weights from resumed model.")
+
+        if optim_resume.exists():
+            optimizer.load_state_dict(torch.load(optim_resume, map_location=device))
+            print(f"Resumed optimizer state from {optim_resume}")
+        else:
+            print("Optimizer checkpoint not found; optimizer will start fresh.")
+
+        if state_resume.exists():
+            train_state = torch.load(state_resume, map_location="cpu")
+            if isinstance(train_state, dict):
+                last_epoch = int(train_state.get("epoch", 0))
+                start_epoch = max(1, last_epoch + 1)
+                ema_step = train_state.get("ema_step")
+                if ema_step is not None:
+                    ema.step = int(ema_step)
+            print(f"Resuming training from epoch {start_epoch}.")
+
     if len(val_ds) > 0:
         preview_batch = build_writer_diverse_preview_batch(val_ds, max_samples=preview_batch_size)
         sampled = sample_preview(
@@ -457,7 +517,11 @@ def main():
         save_eval_bundle(sampled, preview_batch, preview_path / "epoch_0000_bundle.png")
         print("Pre-training eval complete | saved epoch_0000 previews")
 
-    for epoch in range(1, args.epochs + 1):
+    if start_epoch > args.epochs:
+        print(f"Resume epoch {start_epoch} is greater than --epochs={args.epochs}; nothing to train.")
+        return
+
+    for epoch in range(start_epoch, args.epochs + 1):
         train_loss = run_train_epoch(
             train_loader, unet, ema, ema_model, vae, optimizer, mse_loss, ddim, style_extractor, tokenizer, device, latent=args.latent
         )
@@ -465,6 +529,8 @@ def main():
 
         torch.save(unet.state_dict(), best_path)
         torch.save(ema_model.state_dict(), ema_path)
+        torch.save(optimizer.state_dict(), optim_path)
+        torch.save({"epoch": epoch, "ema_step": ema.step}, state_path)
 
         if len(val_ds) > 0:
             preview_batch = build_writer_diverse_preview_batch(val_ds, max_samples=preview_batch_size)
